@@ -1,0 +1,16 @@
+{
+  "description": "Plugin supply-chain security audit — detects marketplace plugin updates at session start",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/plugin-audit.py\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

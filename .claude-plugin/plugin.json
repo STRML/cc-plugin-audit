@@ -1,0 +1,13 @@
+{
+  "name": "cc-plugin-audit",
+  "version": "0.1.0",
+  "description": "Detects plugin marketplace updates at session start and flags security-relevant changes for review",
+  "author": {
+    "name": "Samuel Reed",
+    "url": "https://github.com/STRML"
+  },
+  "homepage": "https://github.com/STRML/cc-plugin-audit",
+  "repository": "https://github.com/STRML/cc-plugin-audit",
+  "license": "MIT",
+  "keywords": ["security", "audit", "plugins", "supply-chain"]
+}

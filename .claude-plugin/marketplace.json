@@ -1,0 +1,18 @@
+{
+  "name": "cc-plugin-audit-dev",
+  "description": "Development marketplace for cc-plugin-audit",
+  "owner": {
+    "name": "Samuel Reed"
+  },
+  "plugins": [
+    {
+      "name": "cc-plugin-audit",
+      "description": "Detects plugin marketplace updates and flags security-relevant changes",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "Samuel Reed"
+      }
+    }
+  ]
+}
