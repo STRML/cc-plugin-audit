@@ -17,11 +17,13 @@ MANIFEST = STATE_DIR / "manifest.json"
 DIFF_DIR = STATE_DIR / "diffs"
 
 # Files/patterns that can execute code or alter Claude's behavior
-SEC_EXTENSIONS = {".sh", ".py", ".js", ".ts", ".mjs", ".cjs"}
+SEC_EXTENSIONS = {".sh", ".py", ".js", ".ts", ".mjs", ".cjs", ".cmd", ".bat", ".ps1"}
 SEC_FILENAMES = {
     "hooks.json", "plugin.json", ".mcp.json", "mcp.json",
     "SKILL.md", "CLAUDE.md", "AGENTS.md", "GEMINI.md",
 }
+# Directories whose .md files control Claude's behavior
+SEC_MD_DIRS = {"commands", "agents", "skills"}
 
 
 def hash_dir(dirpath: Path) -> str:
@@ -75,7 +77,14 @@ def is_sec_relevant(relpath: str) -> bool:
     if name in SEC_FILENAMES:
         return True
     _, ext = os.path.splitext(name)
-    return ext in SEC_EXTENSIONS
+    if ext in SEC_EXTENSIONS:
+        return True
+    # .md files inside commands/, agents/, skills/ control Claude's behavior
+    if ext == ".md":
+        parts = Path(relpath).parts
+        if parts and parts[0] in SEC_MD_DIRS:
+            return True
+    return False
 
 
 def collect_sec_files(dirpath: Path) -> list[str]:
@@ -164,14 +173,8 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
     return change
 
 
-def main():
-    if not CACHE_DIR.is_dir():
-        sys.exit(0)
-
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    DIFF_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Load previous manifest
+def scan_plugins() -> tuple[dict, list[dict], list[str], list[str]]:
+    """Scan cache, return (current_manifest, changes, new_plugins, removed_plugins)."""
     prev: dict = {}
     if MANIFEST.is_file():
         try:
@@ -179,11 +182,10 @@ def main():
         except json.JSONDecodeError:
             pass
 
-    first_run = not prev
-
     current: dict = {}
     changes: list[dict] = []
     new_plugins: list[str] = []
+    seen_keys: set[str] = set()
 
     for marketplace_dir in sorted(CACHE_DIR.iterdir()):
         if not marketplace_dir.is_dir() or marketplace_dir.name.startswith("temp_"):
@@ -192,6 +194,7 @@ def main():
             if not plugin_dir.is_dir():
                 continue
             key = f"{marketplace_dir.name}/{plugin_dir.name}"
+            seen_keys.add(key)
             ver = latest_version(plugin_dir)
             if not ver:
                 continue
@@ -206,11 +209,64 @@ def main():
                     changes.append(change)
                 current[key] = {"version": ver, "hash": change["hash"]}
             else:
-                # Unchanged — carry forward
                 current[key] = prev_entry if prev_entry else {
                     "version": ver,
                     "hash": hash_dir(plugin_dir / ver),
                 }
+
+    # Detect removed plugins
+    removed = sorted(set(prev.keys()) - seen_keys)
+
+    return current, changes, new_plugins, removed
+
+
+def cmd_status():
+    """Print current plugin inventory."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not MANIFEST.is_file():
+        print("No manifest found. Run a session to seed it.")
+        return
+    manifest = json.loads(MANIFEST.read_text())
+    print(f"Tracking {len(manifest)} plugins:\n")
+    for key in sorted(manifest):
+        entry = manifest[key]
+        print(f"  {key}  v{entry['version']}  {entry['hash'][:12]}...")
+    print(f"\nManifest: {MANIFEST}")
+    print(f"Diffs:    {DIFF_DIR}")
+    diffs = sorted(DIFF_DIR.glob("*.diff")) if DIFF_DIR.is_dir() else []
+    if diffs:
+        print(f"\nRecent diffs ({len(diffs)} total):")
+        for d in diffs[-5:]:
+            print(f"  {d.name}")
+
+
+def cmd_reset():
+    """Delete manifest to re-baseline."""
+    if MANIFEST.is_file():
+        MANIFEST.unlink()
+        print("Manifest deleted. Next session will re-seed.")
+    else:
+        print("No manifest to reset.")
+
+
+def main():
+    # CLI flags for manual use
+    if "--status" in sys.argv:
+        cmd_status()
+        return
+    if "--reset" in sys.argv:
+        cmd_reset()
+        return
+
+    if not CACHE_DIR.is_dir():
+        sys.exit(0)
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    DIFF_DIR.mkdir(parents=True, exist_ok=True)
+
+    first_run = not MANIFEST.is_file() or not json.loads(MANIFEST.read_text() or "{}")
+
+    current, changes, new_plugins, removed = scan_plugins()
 
     # Save manifest
     MANIFEST.write_text(json.dumps(current, indent=2) + "\n")
@@ -219,7 +275,7 @@ def main():
     if first_run:
         sys.exit(0)
 
-    if not changes and not new_plugins:
+    if not changes and not new_plugins and not removed:
         sys.exit(0)
 
     # Build context
@@ -240,6 +296,11 @@ def main():
                 parts.append(f"  Security-relevant changes:\n{truncated}")
             elif sec_diff:
                 parts.append(f"  {sec_diff}")
+
+    if removed:
+        parts.append("\nPlugins removed since last session:")
+        for r in removed:
+            parts.append(f"  {r}")
 
     if new_plugins:
         parts.append("\nNew plugins detected (first seen):")
