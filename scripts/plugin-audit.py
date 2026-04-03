@@ -27,7 +27,8 @@ SEC_MD_DIRS = {"commands", "agents", "skills"}
 
 def walk_dir(dirpath: Path):
     """Yield (relpath_str, full_path) for all files, excluding .git and .DS_Store."""
-    for root_str, dirs, files in __import__("os").walk(dirpath):
+    import os
+    for root_str, dirs, files in os.walk(dirpath):
         dirs[:] = [d for d in sorted(dirs) if d != ".git"]
         root = Path(root_str)
         for fname in sorted(files):
@@ -35,6 +36,19 @@ def walk_dir(dirpath: Path):
                 continue
             fpath = root / fname
             yield str(fpath.relative_to(dirpath)), fpath
+
+
+def newest_mtime(dirpath: Path) -> float:
+    """Return the newest file mtime in the directory tree."""
+    max_mt = 0.0
+    for _, fpath in walk_dir(dirpath):
+        try:
+            mt = fpath.stat().st_mtime
+            if mt > max_mt:
+                max_mt = mt
+        except (PermissionError, FileNotFoundError):
+            continue
+    return max_mt
 
 
 def hash_dir(dirpath: Path) -> str:
@@ -120,7 +134,22 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
         "is_new": not prev_entry.get("hash"),
     }
 
-    if old_ver and not change["is_new"]:
+    if change["is_new"]:
+        # First-seen: report security-relevant file inventory
+        sec_files = collect_sec_files(latest_dir)
+        if sec_files:
+            contents = []
+            for relpath in sec_files:
+                fpath = latest_dir / relpath
+                try:
+                    text = fpath.read_text(errors="replace")
+                    contents.append(f"--- {relpath} ---\n{text}")
+                except (PermissionError, OSError):
+                    contents.append(f"--- {relpath} --- (unreadable)")
+            change["sec_inventory"] = "\n".join(contents)
+        else:
+            change["sec_inventory"] = None
+    elif old_ver:
         old_dir = plugin_dir / old_ver
         all_sec = sorted(set(collect_sec_files(old_dir)) | set(collect_sec_files(latest_dir)))
 
@@ -183,21 +212,30 @@ def scan_plugins(prev: dict) -> tuple[dict, list[dict], list[str], list[str]]:
             ver = versions[-1]
 
             prev_entry = prev.get(key, {})
+            latest_dir = plugin_dir / ver
 
-            # Fast path: version string unchanged → skip hashing entirely
+            # Fast path: version + mtime unchanged → skip hashing
             if prev_entry.get("version") == ver and prev_entry.get("hash"):
-                current[key] = prev_entry
-                continue
+                current_mtime = newest_mtime(latest_dir)
+                if current_mtime <= prev_entry.get("mtime", 0):
+                    current[key] = prev_entry
+                    continue
 
             change = audit_plugin(key, plugin_dir, ver, prev_entry)
             if change:
+                mtime = newest_mtime(latest_dir)
                 if change["is_new"]:
-                    new_plugins.append(f"{key}@{ver}")
+                    new_plugins.append(change)
                 else:
                     changes.append(change)
-                current[key] = {"version": ver, "hash": change["hash"]}
+                current[key] = {"version": ver, "hash": change["hash"], "mtime": mtime}
             else:
-                current[key] = {"version": ver, "hash": prev_entry.get("hash", "")}
+                mtime = newest_mtime(latest_dir)
+                current[key] = {
+                    "version": ver,
+                    "hash": prev_entry.get("hash", ""),
+                    "mtime": mtime,
+                }
 
     removed = sorted(set(prev.keys()) - seen_keys)
     return current, changes, new_plugins, removed
@@ -211,7 +249,9 @@ def cmd_status():
     print(f"Tracking {len(manifest)} plugins:\n")
     for key in sorted(manifest):
         entry = manifest[key]
-        print(f"  {key}  v{entry['version']}  {entry['hash'][:12]}...")
+        mt = entry.get("mtime", 0)
+        mt_str = datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M") if mt else "unknown"
+        print(f"  {key}  v{entry['version']}  {entry['hash'][:12]}...  mtime={mt_str}")
     print(f"\nManifest: {MANIFEST}")
     print(f"Diffs:    {DIFF_DIR}")
     diffs = sorted(DIFF_DIR.glob("*.diff")) if DIFF_DIR.is_dir() else []
@@ -279,9 +319,17 @@ def main():
             parts.append(f"  {r}")
 
     if new_plugins:
-        parts.append("\nNew plugins detected (first seen):")
-        for p in new_plugins:
-            parts.append(f"  {p}")
+        parts.append("\nNEW PLUGINS DETECTED (first seen) — review security-relevant files:")
+        for c in new_plugins:
+            parts.append(f"\n  {c['plugin']}@{c['new_version']}")
+            inv = c.get("sec_inventory")
+            if inv:
+                truncated = inv[:4000]
+                if len(inv) > 4000:
+                    truncated += "\n... (truncated)"
+                parts.append(f"  Security-relevant files:\n{truncated}")
+            else:
+                parts.append("  (no security-relevant files)")
 
     output = {
         "hookSpecificOutput": {
