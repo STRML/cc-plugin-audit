@@ -279,6 +279,11 @@ def test_new_plugin_with_inventory(tmp_path):
     assert "SessionStart" in inv
     assert "c2" in inv
 
+    # Threat indicators should be populated
+    threats = np.get("threats", "")
+    assert threats is not None
+    assert "download-execute" in threats or "credential-path-access" in threats or "external-url" in threats
+
 
 def test_removed_plugin_detected(tmp_path):
     """Plugin removed from cache is flagged."""
@@ -391,6 +396,41 @@ def test_malicious_scenario_full(tmp_path):
     diff_content = diff_path.read_text()
     assert "evil.example.com" in diff_content
 
+    # Threat indicators must flag the malicious content
+    threats = c.get("threats", "")
+    assert threats is not None
+    assert "THREAT INDICATORS DETECTED" in threats
+    assert "credential-path-access" in threats
+    assert "external-url" in threats
+
+
+def test_benign_plugin_no_threats(tmp_path):
+    """Benign plugin update produces no critical threat indicators."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    prev = {}
+    current, _, _, _ = audit.scan_plugins(prev)
+    manifest.write_text(json.dumps(current, indent=2))
+
+    # Minor version bump with benign changes
+    updated_files = dict(BENIGN_FILES)
+    updated_files[".claude-plugin/plugin.json"] = json.dumps({
+        "name": "safe-plugin", "version": "1.0.1",
+        "description": "A perfectly safe plugin — now with more formatting",
+    })
+    updated_files["scripts/format.sh"] = "#!/bin/bash\nprettier --write \"$1\" && echo done\n"
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.1", updated_files)
+
+    prev2 = audit.load_manifest()
+    current2, changes, new_plugins, removed = audit.scan_plugins(prev2)
+
+    assert len(changes) == 1
+    c = changes[0]
+    # Should have no critical or high threat indicators
+    threats = c.get("threats")
+    assert threats is None, f"Unexpected threats on benign update: {threats}"
+
 
 def test_temp_dirs_skipped(tmp_path):
     """Directories starting with temp_ are ignored."""
@@ -439,6 +479,7 @@ if __name__ == "__main__":
         test_new_plugin_with_inventory,
         test_removed_plugin_detected,
         test_malicious_scenario_full,
+        test_benign_plugin_no_threats,
         test_temp_dirs_skipped,
         test_mtime_touch_no_false_positive,
     ]

@@ -10,6 +10,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from threat_patterns import scan_files, format_indicators
+
 CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 STATE_DIR = Path.home() / ".claude" / "plugin-audit"
 MANIFEST = STATE_DIR / "manifest.json"
@@ -96,6 +98,18 @@ def collect_sec_files(dirpath: Path) -> list[str]:
     return [rel for rel, _ in walk_dir(dirpath) if is_sec_relevant(rel)]
 
 
+def read_sec_files(dirpath: Path) -> dict[str, str]:
+    """Read contents of all security-relevant files. Returns {relpath: content}."""
+    result = {}
+    for rel in collect_sec_files(dirpath):
+        fpath = dirpath / rel
+        try:
+            result[rel] = fpath.read_text(errors="replace")
+        except (PermissionError, OSError):
+            pass
+    return result
+
+
 def run_diff(args: list[str], timeout: int = 5) -> str:
     try:
         return subprocess.run(
@@ -134,18 +148,15 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
         "is_new": not prev_entry.get("hash"),
     }
 
+    # Scan new version for threat indicators
+    sec_contents = read_sec_files(latest_dir)
+    indicators = scan_files(sec_contents)
+    change["threats"] = format_indicators(indicators) if indicators else None
+
     if change["is_new"]:
         # First-seen: report security-relevant file inventory
-        sec_files = collect_sec_files(latest_dir)
-        if sec_files:
-            contents = []
-            for relpath in sec_files:
-                fpath = latest_dir / relpath
-                try:
-                    text = fpath.read_text(errors="replace")
-                    contents.append(f"--- {relpath} ---\n{text}")
-                except (PermissionError, OSError):
-                    contents.append(f"--- {relpath} --- (unreadable)")
+        if sec_contents:
+            contents = [f"--- {rel} ---\n{text}" for rel, text in sec_contents.items()]
             change["sec_inventory"] = "\n".join(contents)
         else:
             change["sec_inventory"] = None
@@ -297,8 +308,17 @@ def main():
         sys.exit(0)
 
     parts = []
+
+    # Collect all threat indicators across all changed/new plugins
+    all_threats = [c["threats"] for c in changes + new_plugins if c.get("threats")]
+
+    if all_threats:
+        parts.append("*** THREAT INDICATORS FOUND ***\n")
+        parts.extend(all_threats)
+        parts.append("")
+
     if changes:
-        parts.append("PLUGIN UPDATE DETECTED — review security-relevant changes below:")
+        parts.append("PLUGIN UPDATES DETECTED — review security-relevant changes below:")
         for c in changes:
             old = c["old_version"] or "(new)"
             parts.append(f"\n  {c['plugin']}: {old} -> {c['new_version']}")
