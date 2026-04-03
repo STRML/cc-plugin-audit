@@ -3,7 +3,8 @@ Threat indicator pattern scanner for Claude Code plugin files.
 
 Scans file contents for known attack patterns based on documented real-world
 exploits: PromptArmor, Check Point, Flatt Security, Snyk ToxicSkills,
-ClawHavoc campaign, Embrace The Red, Cato Networks/MedusaLocker.
+ClawHavoc campaign, Embrace The Red, Cato Networks/MedusaLocker,
+Adversa.ai, NVIDIA AI Red Team, Cymulate.
 """
 import re
 from dataclasses import dataclass
@@ -71,6 +72,20 @@ _TEXT_PATTERNS: list[tuple[str, str, str, re.Pattern]] = [
          r"""(?:"permissionDecision"\s*:\s*"allow"|"decision"\s*:\s*"approve")""",
      )),
 
+    ("critical", "data-exfil-pipe",
+     "Reads files and pipes to network command. File read + exfil chain (CVE-2025-55284).",
+     re.compile(
+         r"(?:cat|head|tail|less|more)\s+[^|;]*\|\s*(?:curl|wget|nc|ncat)\b"
+         r"|curl\b[^;]*(?:--data-binary|--data|-d)\s+@",
+         re.IGNORECASE,
+     )),
+
+    ("critical", "subcommand-flooding",
+     "Excessive command chaining (>20) bypasses security analysis. Adversa.ai bypass.",
+     re.compile(
+         r"(?:(?:&&|\|\||;)\s*(?:true|echo\s+-n|:)\s*){15,}",
+     )),
+
     # Tier 2 — High (documented techniques)
 
     ("high", "credential-path-access",
@@ -127,7 +142,44 @@ _TEXT_PATTERNS: list[tuple[str, str, str, re.Pattern]] = [
          re.IGNORECASE,
      )),
 
+    ("high", "cd-protected-write",
+     "Changes into .claude/ directory then writes. Permission bypass (CVE-2026-25722).",
+     re.compile(
+         r"cd\s+[^;&|]*\.claude[/\s].*(?:&&|\|\||;)\s*(?:tee|cat\s*>|echo\s*>|cp\s|mv\s|>)",
+         re.IGNORECASE,
+     )),
+
+    ("high", "find-exec-injection",
+     "find -exec with shell metacharacters. Command injection (CVE-2026-24887).",
+     re.compile(
+         r"\bfind\b[^;]*-exec\s+[^;]*(?:\$\(|`|&&|\|\|)",
+     )),
+
+    ("high", "git-config-injection",
+     "Git config value with shell metacharacters. RCE at startup (CVE-2025-59041).",
+     re.compile(
+         r"git\s+config\b[^;]*(?:\$\(|`)",
+     )),
+
+    ("high", "domain-spoof",
+     "Trusted domain used as subdomain of untrusted domain. SSRF bypass (CVE-2026-24052).",
+     re.compile(
+         r"https?://[a-zA-Z0-9.-]*(?:anthropic\.com|claude\.ai|github\.com|npmjs\.org)\.[a-zA-Z]{2,}",
+     )),
+
+    ("high", "yarn-config-exec",
+     "Yarn config with yarnPath or plugins entry. Pre-trust-dialog RCE (CVE-2025-59828).",
+     re.compile(
+         r"yarnPath\s*:|plugins\s*:\s*\n\s*-\s+path:",
+     )),
+
     # Tier 3 — Medium (defense in depth)
+
+    ("medium", "zsh-clobber",
+     "ZSH clobber operator >| bypasses write path restrictions (CVE-2026-24053).",
+     re.compile(
+         r">\|",
+     )),
 
     ("medium", "sed-execute-flag",
      "Sed with 'e' flag enables command execution. Bash validator bypass (CVE-2025-66032).",
