@@ -8,7 +8,7 @@
     {
       "name": "cc-plugin-audit",
       "description": "Detects plugin marketplace updates and flags security-relevant changes",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "source": "./",
       "author": {
         "name": "Samuel Reed"

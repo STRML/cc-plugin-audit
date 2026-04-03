@@ -1,6 +1,6 @@
 {
   "name": "cc-plugin-audit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Detects plugin marketplace updates at session start and flags security-relevant changes for review",
   "author": {
     "name": "Samuel Reed",
