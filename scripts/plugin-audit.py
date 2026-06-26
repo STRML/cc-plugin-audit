@@ -3,6 +3,12 @@
 cc-plugin-audit — SessionStart hook
 Detects plugin marketplace updates and flags security-relevant changes.
 """
+# Lazy annotations (PEP 563): keeps PEP 604 unions like `dict | None` from being
+# evaluated at def-time, so the hook imports cleanly under Python 3.9 too. Without
+# this, `-> dict | None` raised "unsupported operand type(s) for |: 'type' and
+# 'NoneType'" at SessionStart whenever the hook's python3 resolved to <3.10.
+from __future__ import annotations
+
 import hashlib
 import json
 import subprocess
