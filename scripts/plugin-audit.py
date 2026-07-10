@@ -13,6 +13,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,14 @@ SEC_FILENAMES = {
     "SKILL.md", "CLAUDE.md", "AGENTS.md", "GEMINI.md",
 }
 SEC_MD_DIRS = {"commands", "agents", "skills"}
+
+# Known-good path prefixes excluded from threat scanning. These are trusted
+# doc trees that legitimately mention scanner trigger strings (e.g. the
+# built-in claude-api skill docs reference ANTHROPIC_BASE_URL and show
+# curl-to-api.anthropic.com examples).
+IGNORE_PATHS = (
+    "skills/claude-api/",
+)
 
 
 def walk_dir(dirpath: Path):
@@ -90,6 +99,8 @@ def _semver_key(v: str):
 
 
 def is_sec_relevant(relpath: str) -> bool:
+    if any(relpath.startswith(prefix) for prefix in IGNORE_PATHS):
+        return False
     p = Path(relpath)
     if p.name in SEC_FILENAMES:
         return True
@@ -117,12 +128,16 @@ def read_sec_files(dirpath: Path) -> dict[str, str]:
 
 
 def run_diff(args: list[str], timeout: int = 5) -> str:
+    # diff exit codes: 0 same, 1 differ, >=2 trouble. Trouble must be VISIBLE in
+    # the output — an empty sec_diff reads as "no changes", and for an audit tool
+    # a swallowed failure is a silent miss.
     try:
-        return subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
-        ).stdout
-    except Exception:
-        return ""
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if r.returncode >= 2:
+            return f"[diff error rc={r.returncode}: {r.stderr.strip()[:200]}]"
+        return r.stdout
+    except Exception as e:
+        return f"[diff error: {e}]"
 
 
 def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict | None:
@@ -171,12 +186,16 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
         all_sec = sorted(set(collect_sec_files(old_dir)) | set(collect_sec_files(latest_dir)))
 
         diffs = []
-        for relpath in all_sec:
-            old_arg = str(old_dir / relpath) if (old_dir / relpath).exists() else "/dev/null"
-            new_arg = str(latest_dir / relpath) if (latest_dir / relpath).exists() else "/dev/null"
-            d = run_diff(["diff", "-u", old_arg, new_arg])
-            if d.strip():
-                diffs.append(f"--- {relpath} ---\n{d}")
+        # Empty sentinel instead of /dev/null for added/deleted files: some
+        # sandboxes deny diff(1) access to /dev/null, which silently emptied
+        # every new-file diff.
+        with tempfile.NamedTemporaryFile(suffix=".empty") as empty:
+            for relpath in all_sec:
+                old_arg = str(old_dir / relpath) if (old_dir / relpath).exists() else empty.name
+                new_arg = str(latest_dir / relpath) if (latest_dir / relpath).exists() else empty.name
+                d = run_diff(["diff", "-u", old_arg, new_arg])
+                if d.strip():
+                    diffs.append(f"--- {relpath} ---\n{d}")
 
         change["sec_diff"] = "\n".join(diffs) if diffs else None
 
