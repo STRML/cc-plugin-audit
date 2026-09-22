@@ -496,9 +496,35 @@ def test_mtime_touch_no_false_positive(tmp_path):
     assert new_mtime > old_mtime
 
 
+def test_session_markers_ignored(tmp_path):
+    """Claude Code's .in_use/<pid> markers are not plugin content.
+
+    Claude Code writes one into every loaded plugin per session. Counting them
+    made every enabled plugin look updated at every start: a full re-hash,
+    threat scan, and diff, about 13s and 55KB of context per session.
+    """
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    plugin_dir = make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    time.sleep(0.05)
+    (plugin_dir / ".in_use").mkdir()
+    (plugin_dir / ".in_use" / "12345").write_text("")
+
+    current2, changes, new_plugins, removed = audit.scan_plugins(audit.load_manifest())
+
+    assert changes == []
+    assert new_plugins == []
+    # Same mtime means the fast path skipped the re-hash entirely.
+    assert current2 == current
+
+
 if __name__ == "__main__":
     import tempfile
     tests = [
+        test_session_markers_ignored,
         test_first_run_seeds_silently,
         test_no_change_path,
         test_version_bump_detected,

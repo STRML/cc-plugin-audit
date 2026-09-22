@@ -23,6 +23,7 @@ CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 STATE_DIR = Path.home() / ".claude" / "plugin-audit"
 MANIFEST = STATE_DIR / "manifest.json"
 DIFF_DIR = STATE_DIR / "diffs"
+SKIP_DIRS = {".git", ".in_use"}
 
 HASH_CHUNK_SIZE = 65536
 
@@ -43,10 +44,15 @@ IGNORE_PATHS = (
 
 
 def walk_dir(dirpath: Path):
-    """Yield (relpath_str, full_path) for all files, excluding .git and .DS_Store."""
+    """Yield (relpath_str, full_path) for all plugin files.
+
+    Skips .git, .DS_Store, and .in_use: Claude Code writes an .in_use/<pid>
+    marker into every loaded plugin per session, so counting it made every
+    enabled plugin look updated at every start.
+    """
     import os
     for root_str, dirs, files in os.walk(dirpath):
-        dirs[:] = [d for d in sorted(dirs) if d != ".git"]
+        dirs[:] = [d for d in sorted(dirs) if d not in SKIP_DIRS]
         root = Path(root_str)
         for fname in sorted(files):
             if fname == ".DS_Store":
