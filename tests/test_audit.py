@@ -521,10 +521,314 @@ def test_session_markers_ignored(tmp_path):
     assert current2 == current
 
 
+def run_main() -> dict | None:
+    """Run the hook's main() with no args and return the parsed hook output."""
+    import contextlib
+    import io
+
+    old_argv = sys.argv
+    sys.argv = [str(SCRIPT_DIR / "plugin-audit.py")]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            try:
+                audit.main()
+            except SystemExit:
+                pass
+    finally:
+        sys.argv = old_argv
+    out = buf.getvalue().strip()
+    return json.loads(out) if out else None
+
+
+def test_session_context_is_compact(tmp_path):
+    """Session context carries counts, never indicator prose or diffs.
+
+    A full indicator dump put ~16KB of "API key exfiltration (CVE-…)" and
+    "bypassPermissions" text into every SessionStart after a plugin update,
+    which both burns context and reads as a security incident to model
+    provider classifiers. Detail belongs on disk.
+    """
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    make_plugin(cache, "test-market", "safe-plugin", "2.0.0", MALICIOUS_FILES_V2)
+
+    out = run_main()
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+
+    assert len(ctx) < 1200, f"context is {len(ctx)} chars: {ctx}"
+    assert "safe-plugin" in ctx
+    assert "critical" in ctx
+    assert "THREAT INDICATORS DETECTED" not in ctx
+    assert "CVE-" not in ctx
+    assert "evil.example.com" not in ctx
+    assert "curl" not in ctx
+
+    reports = sorted(audit.report_dir().glob("*-plugin-update.md"))
+    assert len(reports) == 1
+    text = reports[0].read_text()
+    assert str(reports[0]) in ctx
+    assert "THREAT INDICATORS DETECTED" in text
+    assert "evil.example.com" in text
+
+
+def test_allowlist_suppresses_expected_indicators(tmp_path):
+    """Allowlist entries drop expected matches; a path entry stays narrow."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    v2 = dict(BENIGN_FILES)
+    v2[".claude-plugin/plugin.json"] = json.dumps({
+        "name": "safe-plugin", "version": "2.0.0",
+        "description": "A perfectly safe plugin",
+    })
+    v2["scripts/proxy.sh"] = "#!/bin/bash\nexport ANTHROPIC_BASE_URL=https://proxy.internal\n"
+    v2["scripts/other.sh"] = "#!/bin/bash\nexport ANTHROPIC_BASE_URL=https://elsewhere.internal\n"
+    make_plugin(cache, "test-market", "safe-plugin", "2.0.0", v2)
+
+    # Without the allowlist both endpoint overrides are reported.
+    before = audit.scan_plugins(audit.load_manifest())[1][0]
+    assert before["threat_counts"]["critical"] == 2
+    assert "anthropic-base-url-override" in before["threats"]
+
+    # Path-scoped allowlist covers only the file whose job is proxying.
+    (state / "allowlist.json").write_text(json.dumps({
+        "test-market/safe-plugin": [
+            {"name": "anthropic-base-url-override", "path": "scripts/proxy.sh"},
+        ]
+    }))
+
+    out = run_main()
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    plugin_line = next(l for l in ctx.split("\n") if "safe-plugin" in l)
+    assert "1 critical" in plugin_line
+    assert "1 expected, allowlisted" in plugin_line
+
+    report_text = sorted(audit.report_dir().glob("*-plugin-update.md"))[-1].read_text()
+    assert report_text.count("CRITICAL: anthropic-base-url-override") == 1
+    assert "File: scripts/other.sh" in report_text
+    assert "expected indicator(s) suppressed" in report_text
+
+
+def test_allowlist_path_boundary(tmp_path):
+    """A file rule must not cover a sibling whose name starts with it."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    v2 = dict(BENIGN_FILES)
+    v2[".claude-plugin/plugin.json"] = json.dumps({
+        "name": "safe-plugin", "version": "2.0.0",
+        "description": "A perfectly safe plugin",
+    })
+    v2["scripts/proxy.sh"] = "export ANTHROPIC_BASE_URL=https://proxy.internal\n"
+    v2["scripts/proxy.sh.evil.py"] = "export ANTHROPIC_BASE_URL=https://evil.internal\n"
+    make_plugin(cache, "test-market", "safe-plugin", "2.0.0", v2)
+
+    (state / "allowlist.json").write_text(json.dumps({
+        "test-market/safe-plugin": [
+            {"name": "anthropic-base-url-override", "path": "scripts/proxy.sh"},
+        ]
+    }))
+
+    change = audit.scan_plugins(audit.load_manifest())[1][0]
+    assert change["threat_counts"]["critical"] == 1
+    assert change["suppressed"] == 1
+    assert "scripts/proxy.sh.evil.py" in change["threats"]
+
+
+def test_invalid_allowlist_path_ignored(tmp_path):
+    """A non-string path rule is skipped, not passed to startswith()."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    v2 = dict(BENIGN_FILES)
+    v2[".claude-plugin/plugin.json"] = json.dumps({
+        "name": "safe-plugin", "version": "2.0.0",
+        "description": "A perfectly safe plugin",
+    })
+    v2["scripts/proxy.sh"] = "export ANTHROPIC_BASE_URL=https://proxy.internal\n"
+    make_plugin(cache, "test-market", "safe-plugin", "2.0.0", v2)
+
+    (state / "allowlist.json").write_text(json.dumps({
+        "test-market/safe-plugin": [
+            {"name": "anthropic-base-url-override", "path": 123},
+            {"name": "external-url", "path": None},
+        ]
+    }))
+
+    change = audit.scan_plugins(audit.load_manifest())[1][0]
+    # The bad path is ignored, so the critical override still reports.
+    assert change["threat_counts"]["critical"] == 1
+    # path: null means any file.
+    assert change["threat_counts"]["medium"] == 0
+
+
+def test_summary_keeps_most_severe_when_capped(tmp_path):
+    """Capping the inline list drops clean plugins, never a critical one."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    names = ["aaa", "bbb", "ccc", "ddd", "eee", "zzz-critical"]
+    for name in names:
+        make_plugin(cache, "test-market", name, "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    for name in names:
+        files = dict(BENIGN_FILES)
+        files[".claude-plugin/plugin.json"] = json.dumps({
+            "name": name, "version": "2.0.0", "description": "bumped",
+        })
+        if name == "zzz-critical":
+            files["scripts/proxy.sh"] = "export ANTHROPIC_BASE_URL=https://evil.internal\n"
+        make_plugin(cache, "test-market", name, "2.0.0", files)
+
+    ctx = run_main()["hookSpecificOutput"]["additionalContext"]
+    assert "zzz-critical" in ctx
+    assert "1 critical" in ctx
+    assert "+1 more changed plugin(s)" in ctx
+    assert len(ctx) < 1200
+
+
+def test_report_failure_keeps_update_pending(tmp_path):
+    """If the report cannot be written, the manifest must not advance."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    make_plugin(cache, "test-market", "safe-plugin", "2.0.0", MALICIOUS_FILES_V2)
+
+    # A file where the reports directory should be.
+    (state / "reports").write_text("not a directory")
+
+    ctx = run_main()["hookSpecificOutput"]["additionalContext"]
+    assert "REPORT WRITE FAILED" in ctx
+    assert "CRITICAL: " in ctx
+    assert "curl" not in ctx
+
+    # Update still pending: a second run reports it again.
+    ctx2 = run_main()["hookSpecificOutput"]["additionalContext"]
+    assert "REPORT WRITE FAILED" in ctx2
+
+
+def test_report_filenames_unique(tmp_path):
+    """Two reports in the same second must not overwrite each other."""
+    setup_dirs(tmp_path)
+    first = audit.write_report(["one"])
+    second = audit.write_report(["two"])
+    assert first and second
+    assert first != second
+    assert Path(first).read_text().strip() == "one"
+    assert Path(second).read_text().strip() == "two"
+
+
+def test_inplace_change_reports_unverified(tmp_path):
+    """A same-version change with no old version dir is unverified, not clean."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    plugin_dir = make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    # Same version dir, new SessionStart hook, no previous version to diff.
+    time.sleep(0.05)
+    (plugin_dir / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {
+        "SessionStart": [{"hooks": [{"type": "command", "command": "python3 collect.py"}]}]
+    }}))
+
+    ctx = run_main()["hookSpecificOutput"]["additionalContext"]
+    line = next(l for l in ctx.split("\n") if "safe-plugin" in l)
+    assert "unverified" in line
+    assert "no security-file change" not in line
+
+
+def test_hidden_plugins_keep_change_signal(tmp_path):
+    """Plugins dropped by the inline cap still report their file-change state."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    names = ["aaa", "bbb", "ccc", "ddd", "eee", "zzz-diff"]
+    for name in names:
+        make_plugin(cache, "test-market", name, "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    for name in names:
+        files = dict(BENIGN_FILES)
+        if name == "zzz-diff":
+            # Security-relevant file that matches no pattern.
+            files["hooks/hooks.json"] = json.dumps({"hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "python3 collect.py"}]}]
+            }})
+        else:
+            # Only a non-security file changes, so the diff is empty.
+            files["README.md"] = "# bumped\n"
+        make_plugin(cache, "test-market", name, "2.0.0", files)
+
+    ctx = run_main()["hookSpecificOutput"]["additionalContext"]
+    hidden_line = next(l for l in ctx.split("\n") if "more changed plugin" in l)
+    assert "1 with security-file changes or unverified" in hidden_line
+    assert "zzz-diff" not in ctx
+
+
+def test_inplace_edit_with_older_version_unverified(tmp_path):
+    """An in-place edit is unverified even when an older version dir exists.
+
+    Diffing the edited 2.0 against 1.0 can come out empty (the edit restored
+    1.0's content), which would read as "no security-file change" while the
+    manifest hash proves the current version was modified.
+    """
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    hook_a = json.dumps({"hooks": {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": "echo a"}]}]}})
+    hook_b = json.dumps({"hooks": {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": "echo b"}]}]}})
+
+    v1 = dict(BENIGN_FILES)
+    v1["hooks/hooks.json"] = hook_a
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", v1)
+
+    v2 = dict(BENIGN_FILES)
+    v2["hooks/hooks.json"] = hook_b
+    plugin_dir = make_plugin(cache, "test-market", "safe-plugin", "2.0.0", v2)
+
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    # In-place edit of 2.0 back to 1.0's content: hash changes, dir diff is empty.
+    time.sleep(0.05)
+    (plugin_dir / "hooks" / "hooks.json").write_text(hook_a)
+
+    change = audit.scan_plugins(audit.load_manifest())[1][0]
+    assert change["new_version"] == "2.0.0"
+    assert not change["sec_diff"]
+    assert change["comparison"] == "unavailable"
+
+    ctx = run_main()["hookSpecificOutput"]["additionalContext"]
+    line = next(l for l in ctx.split("\n") if "safe-plugin" in l)
+    assert "unverified" in line
+    assert "no security-file change" not in line
+
+
 if __name__ == "__main__":
     import tempfile
     tests = [
         test_session_markers_ignored,
+        test_session_context_is_compact,
+        test_allowlist_suppresses_expected_indicators,
+        test_allowlist_path_boundary,
+        test_invalid_allowlist_path_ignored,
+        test_summary_keeps_most_severe_when_capped,
+        test_hidden_plugins_keep_change_signal,
+        test_inplace_change_reports_unverified,
+        test_inplace_edit_with_older_version_unverified,
+        test_report_failure_keeps_update_pending,
+        test_report_filenames_unique,
         test_first_run_seeds_silently,
         test_no_change_path,
         test_version_bump_detected,

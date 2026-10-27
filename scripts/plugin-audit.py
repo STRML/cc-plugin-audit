@@ -146,6 +146,100 @@ def run_diff(args: list[str], timeout: int = 5) -> str:
         return f"[diff error: {e}]"
 
 
+def report_dir() -> Path:
+    """Where full audit detail goes. Derived from STATE_DIR so tests can patch it."""
+    return STATE_DIR / "reports"
+
+
+def allowlist_path() -> Path:
+    return STATE_DIR / "allowlist.json"
+
+
+def load_allowlist() -> dict:
+    """Per-plugin indicators that are expected and must not be reported.
+
+    Shape: {"marketplace/plugin": ["name", {"name": "name", "path": "hooks/x.py"}]}.
+    An entry without "path" covers every file; with "path" it covers that
+    relative path prefix. A first-party plugin whose job is detecting a
+    pattern (endpoint override, settings writes, permission bypass) matches
+    that pattern in its own source, so an unallowlisted scan reports the
+    detector as an attack. The path form keeps the allowlist narrow enough
+    that a real payload elsewhere in the same plugin still shows up.
+    """
+    path = allowlist_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for key, entries in data.items():
+        if not isinstance(entries, list):
+            continue
+        rules = []
+        for entry in entries:
+            if isinstance(entry, str):
+                rules.append((entry, None))
+            elif isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                rule_path = entry.get("path")
+                if rule_path is not None and not isinstance(rule_path, str):
+                    continue
+                rules.append((entry["name"], rule_path))
+        out[key] = rules
+    return out
+
+
+def _path_covers(rule_path: str, file_path: str) -> bool:
+    """A rule path covers that exact file or everything under it as a directory.
+
+    Plain string prefixes are wrong: a rule for `scripts/proxy.sh` must not
+    cover `scripts/proxy.sh.evil.py`.
+    """
+    if rule_path.endswith("/"):
+        return file_path.startswith(rule_path)
+    return file_path == rule_path or file_path.startswith(rule_path + "/")
+
+
+def is_expected(indicator, rules: list) -> bool:
+    for name, path in rules:
+        if indicator.name != name:
+            continue
+        if path is None or _path_covers(path, indicator.file):
+            return True
+    return False
+
+
+def count_severities(indicators: list) -> dict:
+    counts = {"critical": 0, "high": 0, "medium": 0}
+    for ind in indicators:
+        counts[ind.severity] = counts.get(ind.severity, 0) + 1
+    return counts
+
+
+def format_counts(counts: dict) -> str:
+    parts = [f"{counts[s]} {s}" for s in ("critical", "high", "medium") if counts.get(s)]
+    return ", ".join(parts)
+
+
+def write_report(sections: list[str]) -> str | None:
+    """Write full detail to disk; return its path. Raises OSError on failure."""
+    if not sections:
+        return None
+    rdir = report_dir()
+    rdir.mkdir(parents=True, exist_ok=True)
+    base = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-plugin-update"
+    out = rdir / f"{base}.md"
+    n = 1
+    while out.exists():
+        out = rdir / f"{base}-{n}.md"
+        n += 1
+    out.write_text("\n\n".join(sections) + "\n")
+    return str(out)
+
+
 def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict | None:
     """Returns a change record if the plugin changed, else None."""
     latest_dir = plugin_dir / ver
@@ -175,21 +269,35 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
         "is_new": not prev_entry.get("hash"),
     }
 
-    # Scan new version for threat indicators
+    # Scan new version for threat indicators. Expected matches for this plugin
+    # (its own detectors matching their own patterns) are dropped here, so the
+    # session context and the counts never carry them.
     sec_contents = read_sec_files(latest_dir)
     indicators = scan_files(sec_contents)
+    rules = load_allowlist().get(key, [])
+    suppressed = [i for i in indicators if is_expected(i, rules)]
+    indicators = [i for i in indicators if not is_expected(i, rules)]
     change["threats"] = format_indicators(indicators) if indicators else None
+    change["threat_counts"] = count_severities(indicators)
+    change["critical_names"] = sorted({i.name for i in indicators if i.severity == "critical"})
+    change["suppressed"] = len(suppressed)
 
     if change["is_new"]:
         # First-seen: report security-relevant file inventory
+        change["comparison"] = "inventory"
         if sec_contents:
             contents = [f"--- {rel} ---\n{text}" for rel, text in sec_contents.items()]
             change["sec_inventory"] = "\n".join(contents)
         else:
             change["sec_inventory"] = None
     elif old_ver:
+        change["comparison"] = "diffed"
         old_dir = plugin_dir / old_ver
         all_sec = sorted(set(collect_sec_files(old_dir)) | set(collect_sec_files(latest_dir)))
+        # An in-place edit of the CURRENT version means the recorded version is
+        # the one we are scanning: diffing it against the older release says
+        # nothing about what the edit changed, and can even come out empty.
+        in_place = prev_entry.get("version") == ver
 
         diffs = []
         # Empty sentinel instead of /dev/null for added/deleted files: some
@@ -204,6 +312,11 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
                     diffs.append(f"--- {relpath} ---\n{d}")
 
         change["sec_diff"] = "\n".join(diffs) if diffs else None
+        if in_place:
+            change["comparison"] = "unavailable"
+        elif change["sec_diff"] and "[diff error" in change["sec_diff"]:
+            # A failed comparison is not an empty one.
+            change["comparison"] = "unavailable"
 
         now = datetime.now()
         safe_key = key.replace("/", "-")
@@ -218,6 +331,10 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
             f"{'=' * 60}\nSECURITY-RELEVANT DIFF:\n{change['sec_diff'] or '(none)'}\n"
         )
         change["diff_file"] = str(diff_file_path)
+    else:
+        # Same version, no previous version directory: nothing to diff
+        # against, so the security-file question is unanswerable, not "no".
+        change["comparison"] = "unavailable"
 
     return change
 
@@ -301,6 +418,12 @@ def cmd_status():
         print(f"\nRecent diffs ({len(diffs)} total):")
         for d in diffs[-5:]:
             print(f"  {d.name}")
+    rdir = report_dir()
+    reports = sorted(rdir.glob("*-plugin-update*.md")) if rdir.is_dir() else []
+    if reports:
+        print(f"\nRecent reports ({len(reports)} total):")
+        for r in reports[-5:]:
+            print(f"  {r}")
 
 
 def cmd_reset():
@@ -309,6 +432,81 @@ def cmd_reset():
         print("Manifest deleted. Next session will re-seed.")
     else:
         print("No manifest to reset.")
+
+
+def severity_key(change: dict) -> tuple:
+    counts = change.get("threat_counts") or {}
+    return (counts.get("critical", 0), counts.get("high", 0), counts.get("medium", 0))
+
+
+def change_state(change: dict) -> str:
+    """Whether security-relevant files changed, and whether we can tell.
+
+    Nothing to compare against (same version dir only) or a failed diff means
+    the question is open, not answered "no".
+    """
+    if change.get("comparison") == "unavailable":
+        return "security-file change unverified (no previous version to diff)"
+    if change.get("sec_diff") or change.get("sec_inventory"):
+        return "security files changed"
+    return "no security-file change"
+
+
+def build_summary(changes, new_plugins, removed, report, report_error) -> list[str]:
+    """One line per plugin, most severe first, plus the report path.
+
+    Ordering matters: the inline list is capped, so the cap must drop the
+    least severe plugins, never a critical one that happened to sort last.
+    """
+    MAX_INLINE_PLUGINS = 5
+    MAX_INLINE_NAMES = 8
+
+    parts = []
+    ordered = sorted(changes + new_plugins, key=severity_key, reverse=True)
+    listed = ordered[:MAX_INLINE_PLUGINS]
+    rest = ordered[MAX_INLINE_PLUGINS:]
+
+    if report_error:
+        parts.append("PLUGIN UPDATE AUDIT — DETAIL NOT SAVED, review this line now:")
+    else:
+        parts.append("PLUGIN UPDATE AUDIT — open the report for any plugin whose counts or changed files you did not expect:")
+
+    for c in listed:
+        old = c["old_version"] or "(new)"
+        tag = "NEW " if c.get("is_new") else ""
+        counts = c.get("threat_counts") or {}
+        detail = format_counts(counts) or "no indicator matches"
+        if c.get("suppressed"):
+            detail += f" ({c['suppressed']} expected, allowlisted)"
+        parts.append(f"  {tag}{c['plugin']} {old} -> {c['new_version']}: {detail}; {change_state(c)}")
+
+    if rest:
+        totals = {"critical": 0, "high": 0, "medium": 0}
+        for c in rest:
+            for sev, n in (c.get("threat_counts") or {}).items():
+                totals[sev] = totals.get(sev, 0) + n
+        # The hidden plugins must still carry their file-change signal, or the
+        # cap turns "not listed" into "nothing to see".
+        touched = sum(1 for c in rest if change_state(c) != "no security-file change")
+        line = f"  +{len(rest)} more changed plugin(s), totals {format_counts(totals) or 'no indicator matches'}"
+        if touched:
+            line += f"; {touched} with security-file changes or unverified"
+        parts.append(line)
+
+    if removed:
+        parts.append("PLUGINS REMOVED: " + ", ".join(removed))
+
+    if report_error:
+        parts.append(f"REPORT WRITE FAILED: {report_error}. Manifest not advanced; this audit repeats next session.")
+        names = sorted({n for c in changes + new_plugins for n in c.get("critical_names") or []})
+        if names:
+            shown = names[:MAX_INLINE_NAMES]
+            more = "" if len(names) <= MAX_INLINE_NAMES else f" (+{len(names) - MAX_INLINE_NAMES} more)"
+            parts.append("CRITICAL: " + ", ".join(shown) + more)
+    elif report:
+        parts.append(f"Details and diffs: {report}")
+
+    return parts
 
 
 def main():
@@ -330,65 +528,50 @@ def main():
 
     current, changes, new_plugins, removed = scan_plugins(prev)
 
-    MANIFEST.write_text(json.dumps(current, indent=2) + "\n")
-
-    if first_run:
+    if first_run or not (changes or new_plugins or removed):
+        MANIFEST.write_text(json.dumps(current, indent=2) + "\n")
         sys.exit(0)
 
-    if not changes and not new_plugins and not removed:
-        sys.exit(0)
+    # Everything verbose (indicator text, diffs, file inventories) goes to a
+    # report file. The session context carries one line per plugin: a hook that
+    # dumps 15KB of CVE and "API key exfiltration" prose into every SessionStart
+    # both burns context and makes the session look like a security incident to
+    # the model provider's classifiers.
+    sections = []
+    for c in changes + new_plugins:
+        body = [f"## {c['plugin']} {c.get('old_version') or '(new)'} -> {c['new_version']}"]
+        if c.get("threats"):
+            body.append(c["threats"])
+        if c.get("suppressed"):
+            body.append(f"({c['suppressed']} expected indicator(s) suppressed by allowlist)")
+        if c.get("sec_diff"):
+            body.append(f"### security-relevant diff\n{c['sec_diff']}")
+        elif c.get("sec_inventory"):
+            body.append(f"### security-relevant files\n{c['sec_inventory']}")
+        if c.get("diff_file"):
+            body.append(f"Full diff file: {c['diff_file']}")
+        sections.append("\n".join(body))
 
-    parts = []
+    # Report first, manifest second: if the report cannot be written, the
+    # update must not be recorded as reviewed, or the warning is lost.
+    report = None
+    report_error = None
+    try:
+        report = write_report(sections)
+    except OSError as e:
+        report_error = str(e)
 
-    # Collect all threat indicators across all changed/new plugins
-    all_threats = [c["threats"] for c in changes + new_plugins if c.get("threats")]
+    parts = build_summary(changes, new_plugins, removed, report, report_error)
 
-    if all_threats:
-        parts.append("*** THREAT INDICATORS FOUND ***\n")
-        parts.extend(all_threats)
-        parts.append("")
+    # On report failure nothing durable exists: leave the manifest unadvanced so
+    # the next session retries, and the summary carries the critical signal.
+    if not report_error:
+        MANIFEST.write_text(json.dumps(current, indent=2) + "\n")
 
-    if changes:
-        parts.append("PLUGIN UPDATES DETECTED — review security-relevant changes below:")
-        for c in changes:
-            old = c["old_version"] or "(new)"
-            parts.append(f"\n  {c['plugin']}: {old} -> {c['new_version']}")
-            if c.get("diff_file"):
-                parts.append(f"  Full diff: {c['diff_file']}")
-            sec_diff = c.get("sec_diff")
-            if sec_diff:
-                truncated = sec_diff[:4000]
-                if len(sec_diff) > 4000:
-                    truncated += "\n... (truncated — see diff file)"
-                parts.append(f"  Security-relevant changes:\n{truncated}")
-            else:
-                parts.append("  (no changes in security-relevant files)")
-
-    if removed:
-        parts.append("\nPlugins removed since last session:")
-        for r in removed:
-            parts.append(f"  {r}")
-
-    if new_plugins:
-        parts.append("\nNEW PLUGINS DETECTED (first seen) — review security-relevant files:")
-        for c in new_plugins:
-            parts.append(f"\n  {c['plugin']}@{c['new_version']}")
-            inv = c.get("sec_inventory")
-            if inv:
-                truncated = inv[:4000]
-                if len(inv) > 4000:
-                    truncated += "\n... (truncated)"
-                parts.append(f"  Security-relevant files:\n{truncated}")
-            else:
-                parts.append("  (no security-relevant files)")
-
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": "\n".join(parts),
-        }
-    }
-    print(json.dumps(output))
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "\n".join(parts),
+    }}))
     sys.exit(0)
 
 
