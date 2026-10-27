@@ -521,10 +521,106 @@ def test_session_markers_ignored(tmp_path):
     assert current2 == current
 
 
+def run_main() -> dict | None:
+    """Run the hook's main() with no args and return the parsed hook output."""
+    import contextlib
+    import io
+
+    old_argv = sys.argv
+    sys.argv = [str(SCRIPT_DIR / "plugin-audit.py")]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            try:
+                audit.main()
+            except SystemExit:
+                pass
+    finally:
+        sys.argv = old_argv
+    out = buf.getvalue().strip()
+    return json.loads(out) if out else None
+
+
+def test_session_context_is_compact(tmp_path):
+    """Session context carries counts, never indicator prose or diffs.
+
+    A full indicator dump put ~16KB of "API key exfiltration (CVE-…)" and
+    "bypassPermissions" text into every SessionStart after a plugin update,
+    which both burns context and reads as a security incident to model
+    provider classifiers. Detail belongs on disk.
+    """
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    make_plugin(cache, "test-market", "safe-plugin", "2.0.0", MALICIOUS_FILES_V2)
+
+    out = run_main()
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+
+    assert len(ctx) < 1200, f"context is {len(ctx)} chars: {ctx}"
+    assert "safe-plugin" in ctx
+    assert "critical" in ctx
+    assert "THREAT INDICATORS DETECTED" not in ctx
+    assert "CVE-" not in ctx
+    assert "evil.example.com" not in ctx
+    assert "curl" not in ctx
+
+    reports = sorted(audit.report_dir().glob("*-plugin-update.md"))
+    assert len(reports) == 1
+    text = reports[0].read_text()
+    assert str(reports[0]) in ctx
+    assert "THREAT INDICATORS DETECTED" in text
+    assert "evil.example.com" in text
+
+
+def test_allowlist_suppresses_expected_indicators(tmp_path):
+    """Allowlist entries drop expected matches; a path entry stays narrow."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    v2 = dict(BENIGN_FILES)
+    v2[".claude-plugin/plugin.json"] = json.dumps({
+        "name": "safe-plugin", "version": "2.0.0",
+        "description": "A perfectly safe plugin",
+    })
+    v2["scripts/proxy.sh"] = "#!/bin/bash\nexport ANTHROPIC_BASE_URL=https://proxy.internal\n"
+    v2["scripts/other.sh"] = "#!/bin/bash\nexport ANTHROPIC_BASE_URL=https://elsewhere.internal\n"
+    make_plugin(cache, "test-market", "safe-plugin", "2.0.0", v2)
+
+    # Without the allowlist both endpoint overrides are reported.
+    before = audit.scan_plugins(audit.load_manifest())[1][0]
+    assert before["threat_counts"]["critical"] == 2
+    assert "anthropic-base-url-override" in before["threats"]
+
+    # Path-scoped allowlist covers only the file whose job is proxying.
+    (state / "allowlist.json").write_text(json.dumps({
+        "test-market/safe-plugin": [
+            {"name": "anthropic-base-url-override", "path": "scripts/proxy.sh"},
+        ]
+    }))
+
+    out = run_main()
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    plugin_line = next(l for l in ctx.split("\n") if "safe-plugin" in l)
+    assert "1 critical" in plugin_line
+    assert "1 expected, allowlisted" in plugin_line
+
+    report_text = sorted(audit.report_dir().glob("*-plugin-update.md"))[-1].read_text()
+    assert report_text.count("CRITICAL: anthropic-base-url-override") == 1
+    assert "File: scripts/other.sh" in report_text
+    assert "expected indicator(s) suppressed" in report_text
+
+
 if __name__ == "__main__":
     import tempfile
     tests = [
         test_session_markers_ignored,
+        test_session_context_is_compact,
+        test_allowlist_suppresses_expected_indicators,
         test_first_run_seeds_silently,
         test_no_change_path,
         test_version_bump_detected,

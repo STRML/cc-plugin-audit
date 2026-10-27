@@ -146,6 +146,81 @@ def run_diff(args: list[str], timeout: int = 5) -> str:
         return f"[diff error: {e}]"
 
 
+def report_dir() -> Path:
+    """Where full audit detail goes. Derived from STATE_DIR so tests can patch it."""
+    return STATE_DIR / "reports"
+
+
+def allowlist_path() -> Path:
+    return STATE_DIR / "allowlist.json"
+
+
+def load_allowlist() -> dict:
+    """Per-plugin indicators that are expected and must not be reported.
+
+    Shape: {"marketplace/plugin": ["name", {"name": "name", "path": "hooks/x.py"}]}.
+    An entry without "path" covers every file; with "path" it covers that
+    relative path prefix. A first-party plugin whose job is detecting a
+    pattern (endpoint override, settings writes, permission bypass) matches
+    that pattern in its own source, so an unallowlisted scan reports the
+    detector as an attack. The path form keeps the allowlist narrow enough
+    that a real payload elsewhere in the same plugin still shows up.
+    """
+    path = allowlist_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for key, entries in data.items():
+        if not isinstance(entries, list):
+            continue
+        rules = []
+        for entry in entries:
+            if isinstance(entry, str):
+                rules.append((entry, None))
+            elif isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                rules.append((entry["name"], entry.get("path")))
+        out[key] = rules
+    return out
+
+
+def is_expected(indicator, rules: list) -> bool:
+    for name, path in rules:
+        if indicator.name != name:
+            continue
+        if path is None or indicator.file.startswith(path):
+            return True
+    return False
+
+
+def count_severities(indicators: list) -> dict:
+    counts = {"critical": 0, "high": 0, "medium": 0}
+    for ind in indicators:
+        counts[ind.severity] = counts.get(ind.severity, 0) + 1
+    return counts
+
+
+def format_counts(counts: dict) -> str:
+    parts = [f"{counts[s]} {s}" for s in ("critical", "high", "medium") if counts.get(s)]
+    return ", ".join(parts)
+
+
+def write_report(sections: list[str]) -> str | None:
+    """Write full detail to disk; return its path."""
+    if not sections:
+        return None
+    rdir = report_dir()
+    rdir.mkdir(parents=True, exist_ok=True)
+    out = rdir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-plugin-update.md"
+    out.write_text("\n\n".join(sections) + "\n")
+    return str(out)
+
+
 def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict | None:
     """Returns a change record if the plugin changed, else None."""
     latest_dir = plugin_dir / ver
@@ -175,10 +250,17 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
         "is_new": not prev_entry.get("hash"),
     }
 
-    # Scan new version for threat indicators
+    # Scan new version for threat indicators. Expected matches for this plugin
+    # (its own detectors matching their own patterns) are dropped here, so the
+    # session context and the counts never carry them.
     sec_contents = read_sec_files(latest_dir)
     indicators = scan_files(sec_contents)
+    rules = load_allowlist().get(key, [])
+    suppressed = [i for i in indicators if is_expected(i, rules)]
+    indicators = [i for i in indicators if not is_expected(i, rules)]
     change["threats"] = format_indicators(indicators) if indicators else None
+    change["threat_counts"] = count_severities(indicators)
+    change["suppressed"] = len(suppressed)
 
     if change["is_new"]:
         # First-seen: report security-relevant file inventory
@@ -301,6 +383,12 @@ def cmd_status():
         print(f"\nRecent diffs ({len(diffs)} total):")
         for d in diffs[-5:]:
             print(f"  {d.name}")
+    rdir = report_dir()
+    reports = sorted(rdir.glob("*-plugin-update.md")) if rdir.is_dir() else []
+    if reports:
+        print(f"\nRecent reports ({len(reports)} total):")
+        for r in reports[-5:]:
+            print(f"  {r}")
 
 
 def cmd_reset():
@@ -339,48 +427,50 @@ def main():
         sys.exit(0)
 
     parts = []
+    sections = []
+    MAX_INLINE_PLUGINS = 5
 
-    # Collect all threat indicators across all changed/new plugins
-    all_threats = [c["threats"] for c in changes + new_plugins if c.get("threats")]
+    # Everything verbose (indicator text, diffs, file inventories) goes to a
+    # report file. The session context carries one line per plugin: a hook that
+    # dumps 15KB of CVE and "API key exfiltration" prose into every SessionStart
+    # both burns context and makes the session look like a security incident to
+    # the model provider's classifiers.
+    for c in changes + new_plugins:
+        body = [f"## {c['plugin']} {c.get('old_version') or '(new)'} -> {c['new_version']}"]
+        if c.get("threats"):
+            body.append(c["threats"])
+        if c.get("suppressed"):
+            body.append(f"({c['suppressed']} expected indicator(s) suppressed by allowlist)")
+        if c.get("sec_diff"):
+            body.append(f"### security-relevant diff\n{c['sec_diff']}")
+        elif c.get("sec_inventory"):
+            body.append(f"### security-relevant files\n{c['sec_inventory']}")
+        if c.get("diff_file"):
+            body.append(f"Full diff file: {c['diff_file']}")
+        sections.append("\n".join(body))
 
-    if all_threats:
-        parts.append("*** THREAT INDICATORS FOUND ***\n")
-        parts.extend(all_threats)
-        parts.append("")
+    report = write_report(sections)
 
-    if changes:
-        parts.append("PLUGIN UPDATES DETECTED — review security-relevant changes below:")
-        for c in changes:
+    listed = (changes + new_plugins)[:MAX_INLINE_PLUGINS]
+    hidden = len(changes) + len(new_plugins) - len(listed)
+
+    if listed:
+        parts.append("PLUGIN UPDATE AUDIT — act only if a count below looks wrong:")
+        for c in listed:
             old = c["old_version"] or "(new)"
-            parts.append(f"\n  {c['plugin']}: {old} -> {c['new_version']}")
-            if c.get("diff_file"):
-                parts.append(f"  Full diff: {c['diff_file']}")
-            sec_diff = c.get("sec_diff")
-            if sec_diff:
-                truncated = sec_diff[:4000]
-                if len(sec_diff) > 4000:
-                    truncated += "\n... (truncated — see diff file)"
-                parts.append(f"  Security-relevant changes:\n{truncated}")
-            else:
-                parts.append("  (no changes in security-relevant files)")
+            tag = "NEW " if c.get("is_new") else ""
+            counts = c.get("threat_counts") or {}
+            detail = format_counts(counts) or "no threat indicators"
+            if c.get("suppressed"):
+                detail += f" ({c['suppressed']} expected, allowlisted)"
+            parts.append(f"  {tag}{c['plugin']} {old} -> {c['new_version']}: {detail}")
+        if hidden > 0:
+            parts.append(f"  +{hidden} more changed plugin(s)")
+        if report:
+            parts.append(f"Details and diffs: {report}")
 
     if removed:
-        parts.append("\nPlugins removed since last session:")
-        for r in removed:
-            parts.append(f"  {r}")
-
-    if new_plugins:
-        parts.append("\nNEW PLUGINS DETECTED (first seen) — review security-relevant files:")
-        for c in new_plugins:
-            parts.append(f"\n  {c['plugin']}@{c['new_version']}")
-            inv = c.get("sec_inventory")
-            if inv:
-                truncated = inv[:4000]
-                if len(inv) > 4000:
-                    truncated += "\n... (truncated)"
-                parts.append(f"  Security-relevant files:\n{truncated}")
-            else:
-                parts.append("  (no security-relevant files)")
+        parts.append("PLUGINS REMOVED: " + ", ".join(removed))
 
     output = {
         "hookSpecificOutput": {
