@@ -776,6 +776,45 @@ def test_hidden_plugins_keep_change_signal(tmp_path):
     assert "zzz-diff" not in ctx
 
 
+def test_inplace_edit_with_older_version_unverified(tmp_path):
+    """An in-place edit is unverified even when an older version dir exists.
+
+    Diffing the edited 2.0 against 1.0 can come out empty (the edit restored
+    1.0's content), which would read as "no security-file change" while the
+    manifest hash proves the current version was modified.
+    """
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    hook_a = json.dumps({"hooks": {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": "echo a"}]}]}})
+    hook_b = json.dumps({"hooks": {"PostToolUse": [{"hooks": [
+        {"type": "command", "command": "echo b"}]}]}})
+
+    v1 = dict(BENIGN_FILES)
+    v1["hooks/hooks.json"] = hook_a
+    make_plugin(cache, "test-market", "safe-plugin", "1.0.0", v1)
+
+    v2 = dict(BENIGN_FILES)
+    v2["hooks/hooks.json"] = hook_b
+    plugin_dir = make_plugin(cache, "test-market", "safe-plugin", "2.0.0", v2)
+
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    # In-place edit of 2.0 back to 1.0's content: hash changes, dir diff is empty.
+    time.sleep(0.05)
+    (plugin_dir / "hooks" / "hooks.json").write_text(hook_a)
+
+    change = audit.scan_plugins(audit.load_manifest())[1][0]
+    assert change["new_version"] == "2.0.0"
+    assert not change["sec_diff"]
+    assert change["comparison"] == "unavailable"
+
+    ctx = run_main()["hookSpecificOutput"]["additionalContext"]
+    line = next(l for l in ctx.split("\n") if "safe-plugin" in l)
+    assert "unverified" in line
+    assert "no security-file change" not in line
+
+
 if __name__ == "__main__":
     import tempfile
     tests = [
@@ -787,6 +826,7 @@ if __name__ == "__main__":
         test_summary_keeps_most_severe_when_capped,
         test_hidden_plugins_keep_change_signal,
         test_inplace_change_reports_unverified,
+        test_inplace_edit_with_older_version_unverified,
         test_report_failure_keeps_update_pending,
         test_report_filenames_unique,
         test_first_run_seeds_silently,

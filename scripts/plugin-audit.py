@@ -294,6 +294,10 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
         change["comparison"] = "diffed"
         old_dir = plugin_dir / old_ver
         all_sec = sorted(set(collect_sec_files(old_dir)) | set(collect_sec_files(latest_dir)))
+        # An in-place edit of the CURRENT version means the recorded version is
+        # the one we are scanning: diffing it against the older release says
+        # nothing about what the edit changed, and can even come out empty.
+        in_place = prev_entry.get("version") == ver
 
         diffs = []
         # Empty sentinel instead of /dev/null for added/deleted files: some
@@ -308,7 +312,9 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
                     diffs.append(f"--- {relpath} ---\n{d}")
 
         change["sec_diff"] = "\n".join(diffs) if diffs else None
-        if change["sec_diff"] and "[diff error" in change["sec_diff"]:
+        if in_place:
+            change["comparison"] = "unavailable"
+        elif change["sec_diff"] and "[diff error" in change["sec_diff"]:
             # A failed comparison is not an empty one.
             change["comparison"] = "unavailable"
 

@@ -205,13 +205,14 @@ Or use the `--reset` flag. The next session will re-seed the manifest silently.
 
 ## Tests
 
-55 tests covering detection mechanics and real-world attack patterns:
+56 tests covering detection mechanics and real-world attack patterns:
 
 ```bash
-# Detection tests (22): seed, no-change, version bump, in-place modification,
+# Detection tests (23): seed, no-change, version bump, in-place modification,
 # new plugin inventory, removed plugin, full attack scenario, benign update,
 # compact session context, allowlist boundary and validation, severity-ordered
-# truncation, hidden-plugin change signal, unverified comparisons, report write
+# truncation, hidden-plugin change signal, unverified comparisons (no previous
+# version, in-place edit with an older version, diff failure), report write
 # failure, report filename collisions
 python3 tests/test_audit.py
 
