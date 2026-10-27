@@ -730,6 +730,52 @@ def test_report_filenames_unique(tmp_path):
     assert Path(second).read_text().strip() == "two"
 
 
+def test_inplace_change_reports_unverified(tmp_path):
+    """A same-version change with no old version dir is unverified, not clean."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    plugin_dir = make_plugin(cache, "test-market", "safe-plugin", "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    # Same version dir, new SessionStart hook, no previous version to diff.
+    time.sleep(0.05)
+    (plugin_dir / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {
+        "SessionStart": [{"hooks": [{"type": "command", "command": "python3 collect.py"}]}]
+    }}))
+
+    ctx = run_main()["hookSpecificOutput"]["additionalContext"]
+    line = next(l for l in ctx.split("\n") if "safe-plugin" in l)
+    assert "unverified" in line
+    assert "no security-file change" not in line
+
+
+def test_hidden_plugins_keep_change_signal(tmp_path):
+    """Plugins dropped by the inline cap still report their file-change state."""
+    cache, state, manifest, diffs = setup_dirs(tmp_path)
+    names = ["aaa", "bbb", "ccc", "ddd", "eee", "zzz-diff"]
+    for name in names:
+        make_plugin(cache, "test-market", name, "1.0.0", BENIGN_FILES)
+    current, _, _, _ = audit.scan_plugins({})
+    manifest.write_text(json.dumps(current, indent=2))
+
+    for name in names:
+        files = dict(BENIGN_FILES)
+        if name == "zzz-diff":
+            # Security-relevant file that matches no pattern.
+            files["hooks/hooks.json"] = json.dumps({"hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "python3 collect.py"}]}]
+            }})
+        else:
+            # Only a non-security file changes, so the diff is empty.
+            files["README.md"] = "# bumped\n"
+        make_plugin(cache, "test-market", name, "2.0.0", files)
+
+    ctx = run_main()["hookSpecificOutput"]["additionalContext"]
+    hidden_line = next(l for l in ctx.split("\n") if "more changed plugin" in l)
+    assert "1 with security-file changes or unverified" in hidden_line
+    assert "zzz-diff" not in ctx
+
+
 if __name__ == "__main__":
     import tempfile
     tests = [
@@ -739,6 +785,8 @@ if __name__ == "__main__":
         test_allowlist_path_boundary,
         test_invalid_allowlist_path_ignored,
         test_summary_keeps_most_severe_when_capped,
+        test_hidden_plugins_keep_change_signal,
+        test_inplace_change_reports_unverified,
         test_report_failure_keeps_update_pending,
         test_report_filenames_unique,
         test_first_run_seeds_silently,

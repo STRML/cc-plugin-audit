@@ -284,12 +284,14 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
 
     if change["is_new"]:
         # First-seen: report security-relevant file inventory
+        change["comparison"] = "inventory"
         if sec_contents:
             contents = [f"--- {rel} ---\n{text}" for rel, text in sec_contents.items()]
             change["sec_inventory"] = "\n".join(contents)
         else:
             change["sec_inventory"] = None
     elif old_ver:
+        change["comparison"] = "diffed"
         old_dir = plugin_dir / old_ver
         all_sec = sorted(set(collect_sec_files(old_dir)) | set(collect_sec_files(latest_dir)))
 
@@ -306,6 +308,9 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
                     diffs.append(f"--- {relpath} ---\n{d}")
 
         change["sec_diff"] = "\n".join(diffs) if diffs else None
+        if change["sec_diff"] and "[diff error" in change["sec_diff"]:
+            # A failed comparison is not an empty one.
+            change["comparison"] = "unavailable"
 
         now = datetime.now()
         safe_key = key.replace("/", "-")
@@ -320,6 +325,10 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
             f"{'=' * 60}\nSECURITY-RELEVANT DIFF:\n{change['sec_diff'] or '(none)'}\n"
         )
         change["diff_file"] = str(diff_file_path)
+    else:
+        # Same version, no previous version directory: nothing to diff
+        # against, so the security-file question is unanswerable, not "no".
+        change["comparison"] = "unavailable"
 
     return change
 
@@ -404,7 +413,7 @@ def cmd_status():
         for d in diffs[-5:]:
             print(f"  {d.name}")
     rdir = report_dir()
-    reports = sorted(rdir.glob("*-plugin-update.md")) if rdir.is_dir() else []
+    reports = sorted(rdir.glob("*-plugin-update*.md")) if rdir.is_dir() else []
     if reports:
         print(f"\nRecent reports ({len(reports)} total):")
         for r in reports[-5:]:
@@ -422,6 +431,19 @@ def cmd_reset():
 def severity_key(change: dict) -> tuple:
     counts = change.get("threat_counts") or {}
     return (counts.get("critical", 0), counts.get("high", 0), counts.get("medium", 0))
+
+
+def change_state(change: dict) -> str:
+    """Whether security-relevant files changed, and whether we can tell.
+
+    Nothing to compare against (same version dir only) or a failed diff means
+    the question is open, not answered "no".
+    """
+    if change.get("comparison") == "unavailable":
+        return "security-file change unverified (no previous version to diff)"
+    if change.get("sec_diff") or change.get("sec_inventory"):
+        return "security files changed"
+    return "no security-file change"
 
 
 def build_summary(changes, new_plugins, removed, report, report_error) -> list[str]:
@@ -450,15 +472,20 @@ def build_summary(changes, new_plugins, removed, report, report_error) -> list[s
         detail = format_counts(counts) or "no indicator matches"
         if c.get("suppressed"):
             detail += f" ({c['suppressed']} expected, allowlisted)"
-        changed = "security files changed" if (c.get("sec_diff") or c.get("sec_inventory")) else "no security-file change"
-        parts.append(f"  {tag}{c['plugin']} {old} -> {c['new_version']}: {detail}; {changed}")
+        parts.append(f"  {tag}{c['plugin']} {old} -> {c['new_version']}: {detail}; {change_state(c)}")
 
     if rest:
         totals = {"critical": 0, "high": 0, "medium": 0}
         for c in rest:
             for sev, n in (c.get("threat_counts") or {}).items():
                 totals[sev] = totals.get(sev, 0) + n
-        parts.append(f"  +{len(rest)} more changed plugin(s), totals {format_counts(totals) or 'no indicator matches'}")
+        # The hidden plugins must still carry their file-change signal, or the
+        # cap turns "not listed" into "nothing to see".
+        touched = sum(1 for c in rest if change_state(c) != "no security-file change")
+        line = f"  +{len(rest)} more changed plugin(s), totals {format_counts(totals) or 'no indicator matches'}"
+        if touched:
+            line += f"; {touched} with security-file changes or unverified"
+        parts.append(line)
 
     if removed:
         parts.append("PLUGINS REMOVED: " + ", ".join(removed))

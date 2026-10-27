@@ -85,7 +85,7 @@ PLUGIN UPDATE AUDIT — open the report for any plugin whose counts or changed f
 Details and diffs: ~/.claude/plugin-audit/reports/20261027-091709-plugin-update.md
 ```
 
-A plugin with no indicator matches still says whether its security-relevant files changed, so "no indicator matches" never reads as "nothing to look at". The most severe plugins are listed first and the 5-line cap only ever drops clean ones; anything dropped is summarized as a severity total.
+A plugin with no indicator matches still says whether its security-relevant files changed, so "no indicator matches" never reads as "nothing to look at". When there is no previous version to diff (in-place change, cleaned cache) or the diff fails, the line says `security-file change unverified` rather than claiming nothing changed. The most severe plugins are listed first and the 5-line cap only ever drops clean ones; anything dropped is summarized as a severity total plus how many of them have security-file changes or unverified state.
 
 The full report on disk carries the indicators and the security-relevant diff:
 
@@ -205,13 +205,14 @@ Or use the `--reset` flag. The next session will re-seed the manifest silently.
 
 ## Tests
 
-53 tests covering detection mechanics and real-world attack patterns:
+55 tests covering detection mechanics and real-world attack patterns:
 
 ```bash
-# Detection tests (20): seed, no-change, version bump, in-place modification,
+# Detection tests (22): seed, no-change, version bump, in-place modification,
 # new plugin inventory, removed plugin, full attack scenario, benign update,
 # compact session context, allowlist boundary and validation, severity-ordered
-# truncation, report write failure, report filename collisions
+# truncation, hidden-plugin change signal, unverified comparisons, report write
+# failure, report filename collisions
 python3 tests/test_audit.py
 
 # Threat pattern tests (33): PromptArmor, ClawHavoc, ToxicSkills, CVE-2026-21852,
