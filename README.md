@@ -80,10 +80,12 @@ Beyond diffing, the audit scans all security-relevant file contents for known at
 When a plugin updates with suspicious content, the session context gets one line per plugin:
 
 ```
-PLUGIN UPDATE AUDIT — act only if a count below looks wrong:
-  popular-market/trusted-tool 1.0.0 -> 1.0.1: 1 critical, 1 high
+PLUGIN UPDATE AUDIT — open the report for any plugin whose counts or changed files you did not expect:
+  popular-market/trusted-tool 1.0.0 -> 1.0.1: 1 critical, 1 high; security files changed
 Details and diffs: ~/.claude/plugin-audit/reports/20261027-091709-plugin-update.md
 ```
+
+A plugin with no indicator matches still says whether its security-relevant files changed, so "no indicator matches" never reads as "nothing to look at". The most severe plugins are listed first and the 5-line cap only ever drops clean ones; anything dropped is summarized as a severity total.
 
 The full report on disk carries the indicators and the security-relevant diff:
 
@@ -203,12 +205,13 @@ Or use the `--reset` flag. The next session will re-seed the manifest silently.
 
 ## Tests
 
-48 tests covering detection mechanics and real-world attack patterns:
+53 tests covering detection mechanics and real-world attack patterns:
 
 ```bash
-# Detection tests (15): seed, no-change, version bump, in-place modification,
+# Detection tests (20): seed, no-change, version bump, in-place modification,
 # new plugin inventory, removed plugin, full attack scenario, benign update,
-# compact session context, path-scoped allowlist, etc.
+# compact session context, allowlist boundary and validation, severity-ordered
+# truncation, report write failure, report filename collisions
 python3 tests/test_audit.py
 
 # Threat pattern tests (33): PromptArmor, ClawHavoc, ToxicSkills, CVE-2026-21852,

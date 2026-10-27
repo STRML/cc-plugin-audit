@@ -184,16 +184,30 @@ def load_allowlist() -> dict:
             if isinstance(entry, str):
                 rules.append((entry, None))
             elif isinstance(entry, dict) and isinstance(entry.get("name"), str):
-                rules.append((entry["name"], entry.get("path")))
+                rule_path = entry.get("path")
+                if rule_path is not None and not isinstance(rule_path, str):
+                    continue
+                rules.append((entry["name"], rule_path))
         out[key] = rules
     return out
+
+
+def _path_covers(rule_path: str, file_path: str) -> bool:
+    """A rule path covers that exact file or everything under it as a directory.
+
+    Plain string prefixes are wrong: a rule for `scripts/proxy.sh` must not
+    cover `scripts/proxy.sh.evil.py`.
+    """
+    if rule_path.endswith("/"):
+        return file_path.startswith(rule_path)
+    return file_path == rule_path or file_path.startswith(rule_path + "/")
 
 
 def is_expected(indicator, rules: list) -> bool:
     for name, path in rules:
         if indicator.name != name:
             continue
-        if path is None or indicator.file.startswith(path):
+        if path is None or _path_covers(path, indicator.file):
             return True
     return False
 
@@ -211,12 +225,17 @@ def format_counts(counts: dict) -> str:
 
 
 def write_report(sections: list[str]) -> str | None:
-    """Write full detail to disk; return its path."""
+    """Write full detail to disk; return its path. Raises OSError on failure."""
     if not sections:
         return None
     rdir = report_dir()
     rdir.mkdir(parents=True, exist_ok=True)
-    out = rdir / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-plugin-update.md"
+    base = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-plugin-update"
+    out = rdir / f"{base}.md"
+    n = 1
+    while out.exists():
+        out = rdir / f"{base}-{n}.md"
+        n += 1
     out.write_text("\n\n".join(sections) + "\n")
     return str(out)
 
@@ -260,6 +279,7 @@ def audit_plugin(key: str, plugin_dir: Path, ver: str, prev_entry: dict) -> dict
     indicators = [i for i in indicators if not is_expected(i, rules)]
     change["threats"] = format_indicators(indicators) if indicators else None
     change["threat_counts"] = count_severities(indicators)
+    change["critical_names"] = sorted({i.name for i in indicators if i.severity == "critical"})
     change["suppressed"] = len(suppressed)
 
     if change["is_new"]:
@@ -399,6 +419,63 @@ def cmd_reset():
         print("No manifest to reset.")
 
 
+def severity_key(change: dict) -> tuple:
+    counts = change.get("threat_counts") or {}
+    return (counts.get("critical", 0), counts.get("high", 0), counts.get("medium", 0))
+
+
+def build_summary(changes, new_plugins, removed, report, report_error) -> list[str]:
+    """One line per plugin, most severe first, plus the report path.
+
+    Ordering matters: the inline list is capped, so the cap must drop the
+    least severe plugins, never a critical one that happened to sort last.
+    """
+    MAX_INLINE_PLUGINS = 5
+    MAX_INLINE_NAMES = 8
+
+    parts = []
+    ordered = sorted(changes + new_plugins, key=severity_key, reverse=True)
+    listed = ordered[:MAX_INLINE_PLUGINS]
+    rest = ordered[MAX_INLINE_PLUGINS:]
+
+    if report_error:
+        parts.append("PLUGIN UPDATE AUDIT — DETAIL NOT SAVED, review this line now:")
+    else:
+        parts.append("PLUGIN UPDATE AUDIT — open the report for any plugin whose counts or changed files you did not expect:")
+
+    for c in listed:
+        old = c["old_version"] or "(new)"
+        tag = "NEW " if c.get("is_new") else ""
+        counts = c.get("threat_counts") or {}
+        detail = format_counts(counts) or "no indicator matches"
+        if c.get("suppressed"):
+            detail += f" ({c['suppressed']} expected, allowlisted)"
+        changed = "security files changed" if (c.get("sec_diff") or c.get("sec_inventory")) else "no security-file change"
+        parts.append(f"  {tag}{c['plugin']} {old} -> {c['new_version']}: {detail}; {changed}")
+
+    if rest:
+        totals = {"critical": 0, "high": 0, "medium": 0}
+        for c in rest:
+            for sev, n in (c.get("threat_counts") or {}).items():
+                totals[sev] = totals.get(sev, 0) + n
+        parts.append(f"  +{len(rest)} more changed plugin(s), totals {format_counts(totals) or 'no indicator matches'}")
+
+    if removed:
+        parts.append("PLUGINS REMOVED: " + ", ".join(removed))
+
+    if report_error:
+        parts.append(f"REPORT WRITE FAILED: {report_error}. Manifest not advanced; this audit repeats next session.")
+        names = sorted({n for c in changes + new_plugins for n in c.get("critical_names") or []})
+        if names:
+            shown = names[:MAX_INLINE_NAMES]
+            more = "" if len(names) <= MAX_INLINE_NAMES else f" (+{len(names) - MAX_INLINE_NAMES} more)"
+            parts.append("CRITICAL: " + ", ".join(shown) + more)
+    elif report:
+        parts.append(f"Details and diffs: {report}")
+
+    return parts
+
+
 def main():
     if "--status" in sys.argv:
         cmd_status()
@@ -418,23 +495,16 @@ def main():
 
     current, changes, new_plugins, removed = scan_plugins(prev)
 
-    MANIFEST.write_text(json.dumps(current, indent=2) + "\n")
-
-    if first_run:
+    if first_run or not (changes or new_plugins or removed):
+        MANIFEST.write_text(json.dumps(current, indent=2) + "\n")
         sys.exit(0)
-
-    if not changes and not new_plugins and not removed:
-        sys.exit(0)
-
-    parts = []
-    sections = []
-    MAX_INLINE_PLUGINS = 5
 
     # Everything verbose (indicator text, diffs, file inventories) goes to a
     # report file. The session context carries one line per plugin: a hook that
     # dumps 15KB of CVE and "API key exfiltration" prose into every SessionStart
     # both burns context and makes the session look like a security incident to
     # the model provider's classifiers.
+    sections = []
     for c in changes + new_plugins:
         body = [f"## {c['plugin']} {c.get('old_version') or '(new)'} -> {c['new_version']}"]
         if c.get("threats"):
@@ -449,36 +519,26 @@ def main():
             body.append(f"Full diff file: {c['diff_file']}")
         sections.append("\n".join(body))
 
-    report = write_report(sections)
+    # Report first, manifest second: if the report cannot be written, the
+    # update must not be recorded as reviewed, or the warning is lost.
+    report = None
+    report_error = None
+    try:
+        report = write_report(sections)
+    except OSError as e:
+        report_error = str(e)
 
-    listed = (changes + new_plugins)[:MAX_INLINE_PLUGINS]
-    hidden = len(changes) + len(new_plugins) - len(listed)
+    parts = build_summary(changes, new_plugins, removed, report, report_error)
 
-    if listed:
-        parts.append("PLUGIN UPDATE AUDIT — act only if a count below looks wrong:")
-        for c in listed:
-            old = c["old_version"] or "(new)"
-            tag = "NEW " if c.get("is_new") else ""
-            counts = c.get("threat_counts") or {}
-            detail = format_counts(counts) or "no threat indicators"
-            if c.get("suppressed"):
-                detail += f" ({c['suppressed']} expected, allowlisted)"
-            parts.append(f"  {tag}{c['plugin']} {old} -> {c['new_version']}: {detail}")
-        if hidden > 0:
-            parts.append(f"  +{hidden} more changed plugin(s)")
-        if report:
-            parts.append(f"Details and diffs: {report}")
+    # On report failure nothing durable exists: leave the manifest unadvanced so
+    # the next session retries, and the summary carries the critical signal.
+    if not report_error:
+        MANIFEST.write_text(json.dumps(current, indent=2) + "\n")
 
-    if removed:
-        parts.append("PLUGINS REMOVED: " + ", ".join(removed))
-
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": "\n".join(parts),
-        }
-    }
-    print(json.dumps(output))
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "\n".join(parts),
+    }}))
     sys.exit(0)
 
 
